@@ -1,0 +1,1170 @@
+// ===========================================================================
+// Copyright 2019 Autodesk, Inc. All rights reserved.
+//
+// Use of this software is subject to the terms of the Autodesk license
+// agreement provided at the time of installation or download, or which
+// otherwise accompanies this software in either electronic or hard copy form.
+// ===========================================================================
+//
+//  Description:
+//      Functions called from "PaintEffectsToPoly".
+//
+
+// Description:
+// return the full path to the passed in filename
+proc string getPaintEffectsFilename( string $fname )
+{
+	string $outPath = $fname;
+	if( filetest( "-r", $outPath ) ){
+		return $outPath;
+	}  
+	string $visorBase = `getenv "MAYA_LOCATION"`;
+	if ($visorBase != "") {
+		// Set the brushImage directory path appropriately.
+		$outPath = ($visorBase + "/brushImages/" + $fname);
+		if( filetest( "-r", $outPath ) ){
+			return $outPath;
+		}
+	}
+
+	return $fname; // can't find file in brushImages dir, so simply return the original name
+}
+
+proc string getShaderMaterialInfo( string $shadingGroup ){
+	string $con[] = `listConnections $shadingGroup`;
+	int $i;
+	for( $i=0; $i < size( $con ); $i++ ){
+		if( "materialInfo" == nodeType( $con[$i] ) ){
+			return( $con[$i] );
+		}
+	}
+	return "";
+}
+
+
+proc copyRamp(string $source, string $sourceAttr,  string $target, string $targetAttr, int $isColor, float $scale){
+	// for now we assume that source has more entries than target does
+	string $sourceBase = ($source + "." + $sourceAttr);
+	string $targetBase = ($target + "." + $targetAttr);
+	int $numEntries = `getAttr -s $sourceBase`;
+	int $i, $ival;
+	float $fval;
+	for( $i = 0; $i < $numEntries; $i++ ){
+		string $sB = ($sourceBase + "["+$i+"]."+$sourceAttr);
+		string $tB = ($targetBase + "["+$i+"]."+$targetAttr);
+		$fval = getAttr($sB + "_Position");
+		$ival = getAttr($sB + "_Interp");
+		setAttr ($tB + "_Position") $fval;
+		setAttr ($tB + "_Interp") $ival;
+		if( $isColor){
+			$fval = getAttr($sB + "_ColorR");
+			setAttr ($tB + "_ColorR") ($fval * $scale);
+			$fval = getAttr($sB + "_ColorG");
+			setAttr ($tB + "_ColorG") ($fval * $scale);
+			$fval = getAttr($sB + "_ColorB");
+			setAttr ($tB + "_ColorB") ($fval * $scale);
+		} else {
+			$fval = getAttr($sB + "_FloatValue");
+			setAttr ($tB + "_FloatValue") ($fval * $scale);
+		}
+	}
+}
+
+proc createAndAssignShader(string $shaderName, float $color1[], float $color2[],
+			float $incand[], float $specularColor[], float $specular, float $specularPower, 
+			float $glowIntensity,
+			float $translucence, float $transparency[], float $softness,
+			int $texType, int $colorTex, int $opTex, string $texName, 
+			float $texColor1[], float $texColor2[], float $smear, float $smearU, float $smearV,
+			float $fractalRatio, float $fractalAmplitude, float $fractalThreshold,
+			float $repeatU, float $repeatV, float $offsetU, float $offsetV,
+			float $reflectivity, int $textureSpecular, int $isFlat, string $brush,
+			string $mesh )
+			
+{
+	// create shader to match rendering by brush
+	float $spec[3];
+	$spec[0] = $specularColor[0] * $specular;
+	$spec[1] = $specularColor[1] * $specular;
+	$spec[2] = $specularColor[2] * $specular;
+	int $hasSpecular = ( $spec[0] > 0.05 || $spec[1] > 0.05 || $spec[2] > 0.05 );
+	int $doSoftness = ($softness < -0.05 || $softness > 0.1 );
+	int $doSmear = ($smearU > 0.01 || $smearV > 0.01 );
+	int $hasIncand = ($incand[0] > 0.01 || $incand[1] > 0.01 || $incand[2] > 0.01 );
+	int $doReflection = ($reflectivity > 0.05 );
+	float $colorDif = abs($color1[0] - $color2[0]) + abs($color1[1] - $color2[1]) + abs($color1[2] - $color2[2]);
+	int $colorRamp = ($colorDif > 0.05);
+	int $softnessTexture = $doSoftness && $isFlat;
+	int $opacityTex = $opTex || $softnessTexture; 
+	int $hasTransparency = $doSoftness || $opacityTex 
+			|| $transparency[0] > 0.1 || $transparency[1] > 0.1 || $transparency[2] > 0.1;
+
+	int $useRampShader = ($doSoftness && ($softnessTexture == 0)) || $doReflection;
+	string $material;
+	if( $useRampShader ){
+		$material = `shadingNode -asShader -name $shaderName "rampShader"`;
+		setAttr ($material + ".incandescence[0].incandescence_Color") -type double3 $incand[0] $incand[1] $incand[2];
+		if( $hasTransparency ){
+			setAttr ($material + ".transparency[0].transparency_Color") -type double3 
+						$transparency[0] $transparency[1] $transparency[2];
+	
+			if( $hasSpecular ){
+				// paint effects modulates specular based on transparency
+				setAttr ($material + ".specularColor[0].specularColor_Color") -type double3 
+						((1.0-$transparency[0])*$spec[0]) 
+						((1.0-$transparency[1])*$spec[1]) 
+						((1.0-$transparency[2])*$spec[2]);
+			} else {
+				setAttr ($material + ".specularColor[0].specularColor_Color") -type double3 0 0 0;
+			}
+			if( $doSoftness && ($isFlat == 0)){
+				if( $softness > 0 ){
+					setAttr ($material + ".transparency[1].transparency_Color") -type double3 1.0 1.0 1.0;
+					setAttr ($material + ".transparency[1].transparency_Position") 0.0;
+					$softness = sqrt( $softness );
+					setAttr ($material + ".transparency[0].transparency_Position") $softness;
+				} else {
+					setAttr ($material + ".transparency[1].transparency_Color") -type double3 1.0 1.0 1.0;
+					$softness = (1+$softness);
+					setAttr ($material + ".transparency[1].transparency_Position") 1.0;
+					setAttr ($material + ".transparency[0].transparency_Position") ($softness * 0.95);
+				}
+				setAttr ($material + ".transparency[1].transparency_Interp") 1.0;
+			}
+		} else {
+			setAttr ($material + ".specularColor[0].specularColor_Color") -type double3 $spec[0] $spec[1] $spec[2];
+		}
+		setAttr ($material + ".eccentricity") (1.0/sqrt($specularPower));
+		setAttr ($material + ".specularity") 1.0;
+		removeMultiInstance -break true ($material +".specularRollOff[1]");
+		if( $doReflection ){
+			copyRamp( $brush, "environment", $material, "environment", true, 1.0 );
+			copyRamp( $brush, "reflectionRolloff", $material, "reflectivity", false, $reflectivity);
+		}
+	} else {
+		$material = `shadingNode -asShader -name $shaderName "phong"`;
+		setAttr ($material + ".incandescence") -type double3 $incand[0] $incand[1] $incand[2];
+		if( $hasTransparency ){
+			setAttr ($material + ".transparency") -type double3 
+						$transparency[0] $transparency[1] $transparency[2];
+	
+			if( $hasSpecular ){
+				// paint effects modulates specular based on transparency
+				setAttr ($material + ".specularColor") -type double3 
+						((1.0-$transparency[0])*$spec[0]) 
+						((1.0-$transparency[1])*$spec[1]) 
+						((1.0-$transparency[2])*$spec[2]);
+			} else {
+				setAttr ($material + ".specularColor") -type double3 0 0 0;
+			}
+		} else {
+			setAttr ($material + ".specularColor") -type double3 $spec[0] $spec[1] $spec[2];
+		}
+		setAttr ($material + ".cosinePower") $specularPower;
+	}
+
+	
+	setAttr ($material + ".diffuse") (1.0 - $translucence);
+	setAttr ($material + ".translucence") $translucence;
+	setAttr ($material + ".translucenceDepth") 1.0;
+	setAttr ($material + ".translucenceFocus") 0.0;
+	setAttr ($material + ".shadowAttenuation") 0.0;
+	setAttr ($material + ".glowIntensity") $glowIntensity;
+	string $ramp;
+	// if the start end colors are not the same then create a ramp to simulate this
+	if( $colorRamp ){
+		$ramp = `shadingNode -asTexture ramp`;
+		removeMultiInstance -break true ($ramp + ".colorEntryList[2]");
+		// set ramp colors to match color 1 and 2 of brush
+		setAttr ($ramp+".colorEntryList[0].color") -type double3 $color1[0] $color1[1] $color1[2] ;	
+		setAttr ($ramp+".colorEntryList[1].color") -type double3 $color2[0] $color2[1] $color2[2] ;	
+		setAttr ($ramp+".colorEntryList[1].position") 1.0 ;	
+		if( $useRampShader ){
+			connectAttr -f ($ramp+".outColor") ($material+".color[0].color_Color");
+		} else {
+			connectAttr -f ($ramp+".outColor") ($material+".color");
+		}
+	}else {
+		if( $useRampShader ){
+			setAttr ($material + ".color[0].color_Color")  -type double3 $color1[0] $color1[1] $color1[2];
+		} else {
+			setAttr ($material + ".color")  -type double3 $color1[0] $color1[1] $color1[2];
+		}
+	}
+	string $tex, $texOp;
+	if( $colorTex || $opacityTex ){
+			int $needsTransformNode = $repeatU != 1.0 || $repeatV != 1.0 || $offsetU != 0.0 || $offsetV != 0.0;
+			float $colorGain[3]; 	
+			if( $colorTex && !$colorRamp){
+				$colorGain = $color1;
+			} else {
+				$colorGain[0] = $colorGain[1] = $colorGain[2] = 1.0;
+			}
+			if( $colorTex || $opTex ){
+
+				if( $texType != 1 && $texType != 2 ){  // not a ramp
+					if( $smear < 0.8 ){
+						$doSmear = false; // transform node smear is only high frequency
+					}
+					if( $doSmear ){
+						$needsTransformNode = true;
+					}
+				}
+				if( $texType == 0 ){  // checker
+					$tex = `shadingNode -asTexture checker`;
+					if( $colorTex ){
+						setAttr ($tex+".color1") -type double3 $texColor1[0] $texColor1[1] $texColor1[2];
+						setAttr ($tex+".color2") -type double3 $texColor2[0] $texColor2[1] $texColor2[2];
+					}
+				} else if( $texType == 1 || $texType == 2){ // U or VRamp
+					$tex = `shadingNode -asTexture ramp`;
+					removeMultiInstance -break true ($tex + ".colorEntryList[2]");
+					if( $colorTex ){
+						setAttr ($tex+".colorEntryList[0].color") -type double3 $texColor2[0] $texColor2[1] $texColor2[2] ;	
+						setAttr ($tex+".colorEntryList[1].color") -type double3 $texColor1[0] $texColor1[1] $texColor1[2] ;	
+					} else {
+						setAttr ($tex+".colorEntryList[0].color") -type double3 0.0 0.0 0.0 ;	
+						setAttr ($tex+".colorEntryList[1].color") -type double3 1.0 1.0 1.0 ;	
+					}
+					setAttr ($tex+".colorEntryList[1].position") 1.0 ;	
+					if( $texType == 2 ){ // V Ramp
+						setAttr ($tex + ".type") 1;
+					}
+					if( $doSmear ){
+						setAttr ($tex + ".noiseFreq") $smear;
+						setAttr ($tex + ".noise") (($smearU + $smearV) * 0.5);
+					}
+				} else if( $texType == 3 ){ // Fractal
+					$tex = `shadingNode -asTexture fractal`;
+					setAttr ($tex + ".ratio") $fractalRatio;
+					setAttr ($tex + ".amplitude") $fractalAmplitude;
+					setAttr ($tex + ".threshold") $fractalThreshold;
+				} else if( $texType == 4 ){ // File
+					$texName = getPaintEffectsFilename( $texName );
+					if( size( $texName ) > 0 ){
+						$tex = `shadingNode -asTexture file`;
+						setAttr ($tex + ".fileTextureName") -type "string" $texName;
+						if( $opTex ){
+							// see if the image has an alpha channel 
+							int $hasAlpha = `getAttr ($tex + ".fileHasAlpha")`;
+		
+							if( !$hasAlpha ){
+								// if there is not an alpha channel don't connect alpha out		
+								$opTex = false;
+								if($softnessTexture == false){
+									$opacityTex = false;
+								}
+								if( !$colorTex ){
+									//  we can delete the texure if there is no use for color		
+									$needsTransformNode = false;
+									delete $tex;
+								}
+							}
+						}
+					} else {
+						$colorTex = false;
+						$opTex = false;
+						if($softnessTexture == false){
+							$opacityTex = false;
+						}
+						$needsTransformNode = false;
+					}
+				} 
+				if( $needsTransformNode ){
+					string $tform = `shadingNode -asUtility place2dTexture`;
+					setAttr ($tform + ".repeatU" ) $repeatV;
+					setAttr ($tform + ".repeatV" ) $repeatU;
+					setAttr ($tform + ".offsetU" ) $offsetV;
+					setAttr ($tform + ".offsetV" ) $offsetU;
+					if( $doSmear && $texType != 1 && $texType != 2 ){
+						setAttr ($tform + ".noiseU" ) ($smearV * 0.2);
+						setAttr ($tform + ".noiseV" ) ($smearU * 0.2);
+					}
+					connectAttr ($tform + ".outUV") ($tex + ".uv");
+					connectAttr ($tform + ".outUvFilterSize") ( $tex + ".uvFilterSize" );
+					if( $texType == 4 ){ // file textures need these extra connections
+						connectAttr -f ($tform + ".coverage") ($tex + ".coverage");
+						connectAttr -f ($tform + ".translateFrame") ($tex + ".translateFrame");
+						connectAttr -f ($tform + ".rotateFrame") ($tex + ".rotateFrame");
+						connectAttr -f ($tform + ".mirrorU") ($tex + ".mirrorU");
+						connectAttr -f ($tform + ".mirrorV") ($tex + ".mirrorV");
+						connectAttr -f ($tform + ".stagger") ($tex + ".stagger");
+						connectAttr -f ($tform + ".wrapU") ($tex + ".wrapU");
+						connectAttr -f ($tform + ".wrapV") ($tex + ".wrapV");
+						connectAttr -f ($tform + ".repeatUV") ($tex + ".repeatUV");
+						connectAttr -f ($tform + ".offset") ($tex + ".offset");
+						connectAttr -f ($tform + ".rotateUV") ($tex + ".rotateUV");
+						connectAttr -f ($tform + ".noiseUV") ($tex + ".noiseUV");
+						connectAttr -f ($tform + ".vertexUvOne") ($tex + ".vertexUvOne");
+						connectAttr -f ($tform + ".vertexUvTwo") ($tex + ".vertexUvTwo");
+						connectAttr -f ($tform + ".vertexUvThree") ($tex + ".vertexUvThree");
+						connectAttr -f ($tform + ".vertexCameraOne") ($tex + ".vertexCameraOne");
+					}
+				}
+	
+				if( $colorTex ){
+					if( $texType > 2 ){
+						$texColor1[0] *= $colorGain[0];
+						$texColor1[1] *= $colorGain[1];
+						$texColor1[2] *= $colorGain[2];
+						$texColor2[0] *= $colorGain[0];
+						$texColor2[1] *= $colorGain[1];
+						$texColor2[2] *= $colorGain[2];
+						setAttr ($tex + ".colorOffset") -type double3 $texColor2[0] $texColor2[1] $texColor2[2];
+						$colorGain[0] = $texColor1[0] -$texColor2[0];	
+						$colorGain[1] = $texColor1[1] -$texColor2[1];	
+						$colorGain[2] = $texColor1[2] -$texColor2[2];	
+					} 
+					if( $colorRamp ){
+						connectAttr ($tex + ".outColor") ($ramp + ".colorGain");
+					} else {
+						if( $useRampShader ){
+							connectAttr ($tex + ".outColor") ($material + ".color[0].color_Color");
+						}else{
+							connectAttr ($tex + ".outColor") ($material + ".color");
+						}
+					}
+					setAttr ($tex + ".colorGain") -type double3 $colorGain[0] $colorGain[1] $colorGain[2];
+				}
+			}
+			$texOp = $tex;
+			if( $softnessTexture ){
+				$softTex = `shadingNode -asTexture ramp`;
+				removeMultiInstance -break true ($softTex + ".colorEntryList[2]");
+				setAttr ($softTex+".colorEntryList[0].color") -type double3 1.0 1.0 1.0 ;	
+				setAttr ($softTex+".colorEntryList[1].color") -type double3  
+						$transparency[0] $transparency[1] $transparency[2];
+				setAttr ($softTex+".colorEntryList[0].position") 0.0 ;	
+				setAttr ($softTex+".colorEntryList[1].position") $softness ;	
+				setAttr ($softTex + ".type") 1;
+				setAttr ($softTex + ".interpolation") 4;
+				string $tform = `shadingNode -asUtility place2dTexture`;
+				setAttr ($tform + ".repeatU" ) 2;
+				setAttr ($tform + ".mirrorU" ) 1;
+				connectAttr ($tform + ".outUV") ($softTex + ".uv");
+				connectAttr ($tform + ".outUvFilterSize") ( $softTex + ".uvFilterSize" );
+				if( $opTex ){
+					if( $texType == 4 ){ 
+						connectAttr -f ($texOp + ".outTransparency") 
+										($softTex+".colorEntryList[1].color");	
+					} else {
+						string $reverse = `shadingNode -asUtility reverse`;
+						connectAttr -f ($texOp + ".outAlpha") ($reverse + ".inputX");
+						connectAttr -f ($texOp + ".outAlpha") ($reverse + ".inputY");
+						connectAttr -f ($texOp + ".outAlpha") ($reverse + ".inputZ");
+						connectAttr -f ($reverse + ".output")
+										($softTex+".colorEntryList[1].color");	
+					}
+				} 
+				$texOp = $softTex;
+			}
+			if( $opacityTex ){
+				string $outAttr;
+				if( $softnessTexture ) {
+					$outAttr = ($texOp + ".outColor");
+				} else if( $texType == 4 ){ 
+					// only file texture has outTransparency
+					$outAttr = ($texOp + ".outTransparency");
+				} else {
+					// We need to create a reverse node to convert alpha to transparency.
+					// Hopefully the fan out here will not result in extra evaluations of
+					// the texture per sample.
+					string $reverse = `shadingNode -asUtility reverse`;
+					connectAttr -f ($texOp + ".outAlpha") ($reverse + ".inputX");
+					connectAttr -f ($texOp + ".outAlpha") ($reverse + ".inputY");
+					connectAttr -f ($texOp + ".outAlpha") ($reverse + ".inputZ");
+					$outAttr = ($reverse + ".output");
+				}
+				if( $useRampShader ){
+					connectAttr $outAttr ($material + ".transparency[0].transparency_Color");
+				}else{
+					connectAttr $outAttr ($material + ".transparency");
+				}
+			}
+	}
+	if( $hasSpecular && ($opacityTex || ($colorTex && $textureSpecular))){
+		// modulate specular  based on transparency
+		string $mult;
+		if( $opacityTex ){
+			$mult = `shadingNode -asUtility multiplyDivide`;
+			if( $softnessTexture ){
+				string $reverse = `shadingNode -asUtility reverse`;
+				connectAttr -f ($texOp + ".outColor") ($reverse + ".input");
+				connectAttr -f ($reverse + ".output") ($mult + ".input2");
+			}else if( $texType == 4 ){
+				string $reverse = `shadingNode -asUtility reverse`;
+				connectAttr -f ($texOp + ".outTransparency") ($reverse + ".input");
+				connectAttr -f ($reverse + ".output") ($mult + ".input2");
+			} else {
+				connectAttr -f ($texOp + ".outAlpha") ($mult + ".input2X");
+				connectAttr -f ($texOp + ".outAlpha") ($mult + ".input2Y");
+				connectAttr -f ($texOp + ".outAlpha") ($mult + ".input2Z");
+			}
+			
+			setAttr ($mult + ".input1X") ($specularColor[0]*$specular);
+			setAttr ($mult + ".input1Y") ($specularColor[1]*$specular);
+			setAttr ($mult + ".input1Z") ($specularColor[2]*$specular);
+		}
+		if( $colorTex && $textureSpecular ){
+			string $mult2 = `shadingNode -asUtility multiplyDivide`;
+			connectAttr -f ($tex + ".outColor") ($mult2 + ".input2");
+			setAttr ($mult2 + ".input1X") ($specularColor[0]*$specular);
+			setAttr ($mult2 + ".input1Y") ($specularColor[1]*$specular);
+			setAttr ($mult2 + ".input1Z") ($specularColor[2]*$specular);
+			if( $opacityTex ){
+				// combine opacity and color mults together
+				string $mult3 = `shadingNode -asUtility multiplyDivide`;
+				connectAttr -f ($mult + ".output") ($mult3 + ".input1");
+				connectAttr -f ($mult2 + ".output") ($mult3 + ".input2");
+				$mult = $mult3;
+			} else {
+				$mult = $mult2;
+			}
+		}
+		if( $useRampShader ){
+			connectAttr -f ($mult + ".output") ($material + ".specularColor[0].specularColor_Color");
+		} else {
+			connectAttr -f ($mult + ".output") ($material + ".specularColor");
+		}
+	}
+	if( $hasIncand && $opacityTex ){
+		// modulate specular  based on transparency
+		string $mult;
+		if( $opacityTex ){
+			$mult = `shadingNode -asUtility multiplyDivide`;
+			if( $softnessTexture ){
+				string $reverse = `shadingNode -asUtility reverse`;
+				connectAttr -f ($texOp + ".outColor") ($reverse + ".input");
+				connectAttr -f ($reverse + ".output") ($mult + ".input2");
+			}else if( $texType == 4 ){
+				string $reverse = `shadingNode -asUtility reverse`;
+				connectAttr -f ($texOp + ".outTransparency") ($reverse + ".input");
+				connectAttr -f ($reverse + ".output") ($mult + ".input2");
+			} else {
+				connectAttr -f ($texOp + ".outAlpha") ($mult + ".input2X");
+				connectAttr -f ($texOp + ".outAlpha") ($mult + ".input2Y");
+				connectAttr -f ($texOp + ".outAlpha") ($mult + ".input2Z");
+			}
+			
+			setAttr ($mult + ".input1X") ($incand[0]);
+			setAttr ($mult + ".input1Y") ($incand[1]);
+			setAttr ($mult + ".input1Z") ($incand[2]);
+		}
+		if( $useRampShader ){
+			connectAttr -f ($mult + ".output") ($material + ".incandescence[0].incandescence_Color");
+		} else {
+			connectAttr -f ($mult + ".output") ($material + ".incandescence");
+		}
+	}
+
+	// create and assign shading group
+	$sg = `sets -renderable true -noSurfaceShader true -empty -name ($material + "SG")`;
+	defaultNavigation
+		-connectToExisting
+		-source $material
+		-destination $sg;
+	select -r $mesh;
+	hyperShade -assign $sg;
+
+	if( $opacityTex && !$useRampShader ){
+		// set up connections for combined channels texturing
+		string $matInfo = getShaderMaterialInfo( $sg );
+		if( $matInfo != ""){
+			setAttr ($matInfo + ".texturePlug") -type "string" ($material + ".outColor");
+			connectAttr -f ($material + ".message") ($matInfo + ".texture[0]");
+		}
+	}
+}
+
+//
+//  Procedure Name:
+//      doPaintEffectsToGeom
+//
+//  Description:
+//		This is the function that gets called from "PaintEffectsToPoly" 
+//		"PaintEffectsToNurbs" and "PaintEffectsToCurves"
+//
+//  Input Arguments:
+//	ConstructionHistory  0 = OFF, 1 = ON
+//	VertexColorMode 0 = NONE, 1 = Color, 2 = Illuminated	
+//	QuadOutput 0 = triangles, 1 = quads
+//	Output type 0 = poly, 1 = nurbs, 2 = curve
+//
+//  Return Value:
+//      None.
+//
+//
+global proc int doPaintEffectsToGeom( int $constructionHistory, int $vertColorMode,
+									  int $quadOutput, int $hideStrokes, int $polyLimit, int $outputType)
+{
+	int $status = 0;
+
+	string $strokes[] = `ls -sl -dag -type pfxGeometry`;
+	int $len = size($strokes);
+	if( $len < 1 ){
+		error( (uiRes("m_doPaintEffectsToGeom.kSelectNode")) );
+		return $status;
+	}
+	string $newMeshes[];
+	string $selectedMeshes[];
+	int $meshCount = 0;
+	int $i;	
+
+	// always create shaders with textures.. originally we didn't do this if colorPerVertex was used.
+	int $createTexturedShaders = true; 
+	string $cameraTranslate = "";
+	string $renderCamera = getCameraForPfx();	
+	if( $renderCamera != "" ){	
+		if( getAttr( $renderCamera + ".orthographic") ){
+			float $orthoCenter[] = getAttr( $renderCamera + ".center" );	
+			// set the camera point to a large value down the
+			// ortho axis... not perfect but better than having
+			// it at the origin	
+			$orthoCenter[0] *= 1000.0;
+			$orthoCenter[1] *= 1000.0;
+			$orthoCenter[2] *= 1000.0;
+			for($i = 0; $i < $len; $i++) {
+				string $stroke = $strokes[$i];
+				string $camAt = ($stroke + ".cameraPoint");
+				string $oldCon = `connectionInfo -sfd $camAt`;	
+				if( size( $oldCon ) > 0 ){
+					disconnectAttr $oldCon $camAt;
+				}
+				setAttr $camAt $orthoCenter[0] $orthoCenter[1] $orthoCenter[2];
+			}
+		} else {	
+			// for persp cameras we connect the camera translate to the stroke
+			string $transStr = $renderCamera + ".translate";
+			if(`objExists $transStr`) {
+				$cameraTranslate = $transStr;
+			}
+		}
+	}
+
+	for($i = 0; $i < $len; $i++) {
+		string $stroke = $strokes[$i];
+
+		int $vis = `getAttr  ($stroke + ".visibility")`;
+		if (!$vis){
+			 continue;
+		}
+		int $isPfxHair = (nodeType( $stroke ) == "pfxHair" ); 
+		int $isPfxToon = (nodeType( $stroke ) == "pfxToon" ); 
+		string $nurbsGroups[];
+
+		if( $outputType == 1 || $outputType == 2){
+			// hook up the camera for nurbs curves or surfaces
+			if( $isPfxToon && $cameraTranslate != "" ){
+				int $profile = getAttr( $stroke + ".profileLines" );	
+				int $screenspace = getAttr( $stroke + ".screenspaceWidth" );
+				int $creases = getAttr( $stroke + ".creaseLines" );
+				int $backfacing = getAttr( $stroke + ".backfacingCreases" );
+				float $modulation = getAttr( $stroke + ".creaseWidthModulation" );	
+				if( $profile == 1 || $screenspace ||
+				    ($creases && (!$backfacing || $modulation > 0))){
+					if( !`isConnected $cameraTranslate ($stroke + ".cameraPoint")` ){ 
+						connectAttr -f $cameraTranslate ($stroke + ".cameraPoint");
+					}
+				}
+			}
+			if( $outputType == 1 ){
+				// create surfaces
+				$nurbsGroups = createPfxOutCurves( $stroke, true );
+			} else if ($outputType == 2 ){
+				// create curves
+				$nurbsGroups = createPfxOutCurves( $stroke, false );
+			}
+			// hide strokes for both curves and surfaces
+			setAttr ($stroke + ".displayPercent") 0;
+			if($hideStrokes){
+				setAttr  ($stroke + ".visibility") 0;
+			}
+			if ($outputType == 2 ){
+				continue; // no need to create shaders for curves
+			}
+		}
+
+		int $hasBrush = false;
+		string $brush = "";
+		// get the stroke's brush
+		string $attr = $stroke + ".brush";
+		string $result = `connectionInfo -sfd $attr`;
+		if( size( $result ) > 0 ){
+			string $buffer[];
+			int $num = `tokenize $result "." $buffer`;
+			$brush = $buffer[0];
+			$hasBrush = true;
+		}
+
+		if( !$hasBrush && !($isPfxHair || $isPfxToon) ){
+			continue; // skip if stroke has no brush
+		}
+
+		string $hairSystem = "";
+		if( $isPfxHair ){
+			string $inputs[] = `listConnections -sh 1 ($stroke + ".renderHairs")`;
+			if( size($inputs) > 0 ){
+				$hairSystem = $inputs[0];
+			}
+			if( $hairSystem == "" || (nodeType( $hairSystem ) != "hairSystem") ){
+				continue;
+			}
+			if( !$hasBrush ){
+				$brush = $hairSystem; // for naming
+			}
+		}
+
+		setAttr ($stroke + ".meshVertexColorMode") $vertColorMode;
+		setAttr ($stroke + ".meshQuadOutput") $quadOutput;
+		setAttr ($stroke + ".meshPolyLimit") $polyLimit;
+
+		string $meshParent, $mainMesh;
+		if( 0 == $outputType ){
+			// set up mesh parent xform
+			$meshParent = `createNode transform -name ($brush+"MeshGroup") `;
+	
+			// setup mainMesh
+			string $mainParent = `createNode transform -name ($brush+"Main") -p $meshParent`;
+			$mainMesh = createMeshNodeUnder($brush+"MainShape", $mainParent);
+	
+	
+			// make sure we get the full path, since a name that's unique now
+			// might not be unique by the time we're done
+			$selectedMeshes = `selectedNodes`;
+			$newMeshes[$meshCount] = $selectedMeshes[0];
+	
+			connectAttr ($stroke + ".worldMainMesh[0]") ($mainMesh + ".inMesh");
+		} else {
+			$mainMesh = $nurbsGroups[0];
+			$newMeshes[$meshCount] = $mainMesh;
+		}
+		$meshCount++;
+		string $shaderName, $sg;
+		if( !$hasBrush && $isPfxHair){
+			// pfxHair without a brush.. create a hairTube shader 
+			$shaderName = ($brush + "Shader");
+			$sg = ($shaderName + "SG");
+			if( !objExists( $shaderName ) || !objExists( $sg ) ){
+				// create the shader for this brush if it does not yet exist
+
+				string $material = `shadingNode -asShader "hairTubeShader"`;
+				float $spec[] = getAttr( $hairSystem + ".specularColor" );	
+				setAttr ($material + ".specularColor") -type double3 $spec[0] $spec[1] $spec[2];
+				float $col[] = getAttr( $hairSystem + ".hairColor" );	
+				float $pow = getAttr( $hairSystem + ".specularPower" );
+				if( $pow < 2.0 ){
+					$pow = 2.0; // minimum on phong node
+				}
+				setAttr ($material + ".tubeDirection") 1;
+				setAttr ($material + ".specularPower") $pow;
+				setAttr ($material + ".color") -type double3 $col[0] $col[1] $col[2];
+	
+				// copy the hairSystem.hairColorScale ramp attribute to hairTubeShader.colorScale
+				string $colorScale = ($material + ".colorScale");
+				string $hairColorScale = ($hairSystem + ".hairColorScale");
+				removeMultiInstance $colorScale;
+				string $multiAttrs[] = `listAttr -multi -write -scalar -visible -hasData $hairColorScale`;
+				int $j;
+				for( $j = 0; $j < size( $multiAttrs ); $j++ ){
+					string $attr = $multiAttrs[$j];
+					string $toAttr = `substitute "hairColor" $attr "color"`;
+					// two instances of hairColor in string
+					$toAttr = `substitute "hairColor" $toAttr "color"`; 
+					float $val = getAttr ($hairSystem + "." + $attr);
+					setAttr ($material + "." + $toAttr) $val;
+				}
+	
+				// create shading group
+				$sg = `sets -renderable true -noSurfaceShader true -empty -name ($material + "SG")`;
+				defaultNavigation
+					-connectToExisting
+					-source $material
+					-destination $sg;
+			}			
+			// assign shader to mesh
+			select -r $mainMesh;
+			hyperShade -assign $sg;
+			if( !$constructionHistory ){
+				delete -ch $mainMesh;
+			}
+			if($hideStrokes){
+				setAttr  ($stroke + ".visibility") 0;
+			}
+			continue;
+		} 
+		if( $isPfxToon ){
+			if( $cameraTranslate != "" ){
+				int $profile = getAttr( $stroke + ".profileLines" );	
+				int $screenspace = getAttr( $stroke + ".screenspaceWidth" );	
+				int $creases = getAttr( $stroke + ".creaseLines" );
+				int $backfacing = getAttr( $stroke + ".backfacingCreases" );
+				float $modulation = getAttr( $stroke + ".creaseWidthModulation" );	
+				if( $profile == 1 || $screenspace ||
+				    ($creases && (!$backfacing || $modulation > 0))){
+					if( !`isConnected $cameraTranslate ($stroke + ".cameraPoint")` ){ 
+						connectAttr -f $cameraTranslate ($stroke + ".cameraPoint");
+					}
+				}
+			}
+			if( !$hasBrush){
+				// pfxToon without a brush.. create a surfaceShader 
+				$shaderName = ($stroke + "Shader");
+				$sg = ($shaderName + "SG");
+				if( !objExists( $shaderName ) || !objExists( $sg ) ){
+				// create the shader for this brush if it does not yet exist
+					
+					string $material = `shadingNode -asShader "surfaceShader"`;
+					float $col[] = getAttr( $stroke + ".profileColor" );	
+	
+					setAttr ($material + ".outColor") -type double3 $col[0] $col[1] $col[2];
+	
+					// create shading group
+					$sg = `sets -renderable true -noSurfaceShader true -empty -name ($material + "SG")`;
+					defaultNavigation
+						-connectToExisting
+						-source $material
+						-destination $sg;
+				}			
+				// assign shader to mesh
+				select -r $mainMesh;
+				hyperShade -assign $sg;
+				if( !$constructionHistory ){
+					delete -ch $mainMesh;
+				}
+
+				// shadows, refractions and reflections won't look good
+				if($outputType == 0) {
+					// yes, it really was a mesh
+					setAttr ($mainMesh + ".castsShadows") 0;
+					setAttr ($mainMesh + ".receiveShadows") 0;
+					setAttr ($mainMesh + ".visibleInReflections") 0;
+					setAttr ($mainMesh + ".visibleInRefractions") 0;
+				} else if ($outputType == 1){
+
+					// OK, it's not really a mesh, it's a bunch of nurbs surfacs
+					// perhaps we should rename the variable to $mainSurface
+
+					string $nurbsThings[] = `listRelatives -ad $mainMesh`;
+					string $nurbsShapes[] = `ls -shapes $nurbsThings`;
+					for( $ns in $nurbsShapes) {
+						setAttr ($ns + ".castsShadows") 0;
+						setAttr ($ns + ".receiveShadows") 0;
+						setAttr ($ns + ".visibleInReflections") 0;
+						setAttr ($ns + ".visibleInRefractions") 0;
+						setAttr ($ns + ".miFinalGatherCast") 0;
+						setAttr ($ns + ".miFinalGatherReceive") 0;
+					}
+				}
+	
+				if($hideStrokes){
+					setAttr  ($stroke + ".visibility") 0;
+				}
+				continue;
+			} else {
+			}
+			
+		}
+
+		int $brushType = getAttr( $brush + ".brushType" );
+		int $tubes = getAttr( $brush + ".tubes" );
+		int $hardEdges = getAttr( $brush + ".hardEdges" );
+		setAttr ($stroke + ".meshHardEdges") $hardEdges;
+		float $incand1[] = `getAttr ($brush + ".incandescence1")`;
+		float $incand2[] = `getAttr ($brush + ".incandescence2")`;
+		float $transp1[] = `getAttr ($brush + ".transparency1")`;
+		float $transp2[] = `getAttr ($brush + ".transparency2")`;
+		float $transp[3];
+		float $softness = getAttr( $brush + ".softness" );
+		float $glow = getAttr( $brush + ".glow" );
+		float $shaderGlow = getAttr( $brush + ".shaderGlow" );
+		float $glowIntensity = $glow + $shaderGlow;
+		float $fractalAmplitude = getAttr( $brush + ".fractalAmplitude" );
+		float $fractalRatio = getAttr( $brush + ".fractalRatio" );
+		float $fractalThreshold = getAttr( $brush + ".fractalThreshold" );
+		if( $tubes ){
+			$transp[0] = ($transp1[0] + $transp2[0]) * 0.5;
+			$transp[1] = ($transp1[1] + $transp2[1]) * 0.5;
+			$transp[2] = ($transp1[2] + $transp2[2]) * 0.5;
+			$incand1[0] = ($incand1[0] + $incand2[0]) * 0.5;
+			$incand1[1] = ($incand1[1] + $incand2[1]) * 0.5;
+			$incand1[2] = ($incand1[2] + $incand2[2]) * 0.5;
+		} else {
+			$transp = $transp1;
+		}
+		int $textureSpecular = false;
+		if( $brushType < 4 ){
+			// When converting stamp type brushes to mesh
+			// we do not usually want low levels of softness
+			// and transparency.
+			if( $softness > -0.3 && $softness < 0.3 ){
+				$softness = 0.0;
+			}
+			if( $transp[0] < 0.2 ){
+				$transp[0] = 0.0;
+			}
+			if( $transp[1] < 0.2 ){
+				$transp[1] = 0.0;
+			}
+			if( $transp[2] < 0.2 ){
+				$transp[2] = 0.0;
+			}
+			// Stamp brushes apply any color textures to specular
+			// as well.
+			$textureSpecular = true;
+		}
+
+		float $specularColor[] = `getAttr ($brush + ".specularColor")`;
+		float $specularPower = `getAttr ($brush + ".specularPower")`;
+		if( $specularPower < 2.0 ){
+			$specularPower = 2.0; // minimum on phong node
+		}
+		int $texType = `getAttr($brush + ".textureType")`;
+		int $colorTex = `getAttr($brush + ".mapColor")`;
+		int $opacityTex = `getAttr($brush + ".mapOpacity")`;
+		float $repeatU = `getAttr($brush + ".repeatU")`;
+		float $repeatV = `getAttr($brush + ".repeatV")`;
+		float $offsetU = `getAttr($brush + ".offsetU")`;
+		float $offsetV = `getAttr($brush + ".offsetV")`;
+		string $texName = `getAttr($brush + ".imageName")`;
+
+		int $linkCamera = `getAttr( $brush + ".forwardTwist" )`;
+		float $flatness1 = `getAttr($brush + ".flatness1" )`;
+		float $flatness2 = `getAttr($brush + ".flatness2" )`;
+		int $isFlat;
+		if( $brushType < 4 ){
+			$isFlat =  $flatness1 > 0.7 && (($tubes==0) || $flatness2 > 0.7);
+		} else {
+			$isFlat =  $flatness1 > 0.999 && (($tubes==0) || $flatness2 > 0.999);
+		}
+
+		if( !$linkCamera && ($brushType < 4 ) && $opacityTex ){
+			// to better simulate the 2D map method we use forwardTwist
+			// when converting stamp style brushes. TstrokeShape has the
+			// same checks as the code below and sets forward twist on
+			// during the pfxToPoly call.
+			int  $mapMethod = `getAttr($brush + ".mapMethod" )`;
+			if( $mapMethod == 2 ){
+				if( $flatness1 < 0.05 && (($tubes==0) || $flatness2 < 0.05 )){
+					$linkCamera = true;
+					$isFlat = true;
+				}
+			} 
+		} 
+
+
+		$shaderName = ($brush + "Shader");
+		$sg = ($shaderName + "SG");
+		if( objExists( $shaderName ) && objExists( $sg ) ){ 
+			select -r $mainMesh;
+			hyperShade -assign $sg;
+		} else if( $createTexturedShaders ){
+			// create shader to match branch rendering by brush
+			float $color1[] = `getAttr ($brush + ".color1")`;
+			float $color2[] = $color1;
+			if( $tubes ){
+				$color2 = `getAttr ($brush + ".color2")`;
+
+				// We try to mimick depth shadow effect
+				// by darkening color1.
+				float $depthShadow = `getAttr($brush + ".depthShadow")`;	
+				if( $depthShadow > 0.05 ){
+					float $lengthMax = `getAttr($brush + ".lengthMax")`;	
+					float $depthShadowDepth = `getAttr($brush + ".depthShadowDepth")`;	
+					float $weight = $depthShadowDepth/$lengthMax;	
+					if( $weight > 0 ){
+						if( $weight < 1.0 ){
+							$depthShadow *= $weight;
+						} 
+						$depthShadow = 1.0-$depthShadow;
+						$color1[0] *= $depthShadow;
+						$color1[1] *= $depthShadow;
+						$color1[2] *= $depthShadow;
+					}
+				}
+			}
+			float $specular = `getAttr ($brush + ".specular")`;
+			float $translucence = `getAttr ($brush + ".translucence")`;
+			float $smearU = `getAttr ($brush + ".smearU")`;
+			float $smearV = `getAttr ($brush + ".smearV")`;
+			float $smear = `getAttr ($brush + ".smear")`;
+			float $texColor1[] = `getAttr ($brush + ".texColor1")`;
+			float $texColor2[] = `getAttr ($brush + ".texColor2")`;
+			float $reflectivity = 0.0;		
+			if( $brushType == 5 ){ // mesh brush
+				$reflectivity = `getAttr ($brush + ".branchReflectivity")`;
+			}
+		
+			createAndAssignShader(($brush + "Shader"), $color1, $color2,
+						$incand1, $specularColor, $specular, $specularPower, $glowIntensity,
+						$translucence, $transp, $softness,
+						$texType, $colorTex, $opacityTex, $texName, 
+						$texColor1, $texColor2, $smear, $smearU, $smearV,
+						$fractalRatio, $fractalAmplitude, $fractalThreshold,
+						$repeatU, $repeatV, $offsetU, $offsetV, 
+						$reflectivity, $textureSpecular, $isFlat, $brush, $mainMesh );
+
+		} else {
+			// color per vertex.. create simple surface shader 
+			string $material = `shadingNode -asShader "lambert"`;
+			// create and assign shading group
+			$sg = `sets -renderable true -noSurfaceShader true -empty -name ($material + "SG")`;
+			defaultNavigation
+				-connectToExisting
+				-source $material
+				-destination $sg;
+			select -r $mainMesh;
+			hyperShade -assign $sg;
+		}
+
+		if( !$constructionHistory ){
+			delete -ch $mainMesh;
+		}
+	
+
+	
+		// setup leafMesh
+		int $leaves = ($tubes && getAttr( $brush + ".leaves" ));
+		if( $leaves ){
+			if( getAttr( $brush + ".leafForwardTwist" )) {
+				$linkCamera = true;
+			}
+			int $useBranch = `getAttr($brush + ".leafUseBranchTex")`;
+			float $flatness = `getAttr($brush + ".leafFlatness" )`;
+			$isFlat = $flatness > 0.999
+					|| ($brushType < 4 && $flatness > 0.7);
+			if( !$linkCamera && ($brushType < 4 ) && !$useBranch ){
+				// to better simulate the 2D map method we use forwardTwist
+				// when converting stamp style brushes. TstrokeShape has the
+				// same checks as the code below and sets forward twist on
+				// during the pfxToPoly call.
+				if( $flatness < 0.3 ){
+					string $tName = `getAttr ($brush + ".leafImage")`;
+					if( size( $tName ) > 0 ){
+						$linkCamera = true;
+						$isFlat = true;
+					}
+				} 
+			} 
+			string $leafMesh;
+			if( 0 == $outputType ){
+				string $leafParent = `createNode transform -name ($brush+"Leaf") -p $meshParent`;
+				$leafMesh = createMeshNodeUnder($brush+"LeafShape", $leafParent);
+	
+				// make sure we get the full path, since a name that's unique now
+				// might not be unique by the time we're done
+				$selectedMeshes = `selectedNodes`;
+				$newMeshes[$meshCount] = $selectedMeshes[0];
+	
+				connectAttr ($stroke + ".worldLeafMesh[0]") ($leafMesh + ".inMesh");
+			} else {
+				$leafMesh = $nurbsGroups[1];
+				$newMeshes[$meshCount] = $leafMesh;
+			}
+			$meshCount++;
+			$shaderName = ($brush + "LeafShader");
+			$sg = ($shaderName + "SG");
+			if( objExists( $shaderName ) && objExists( $sg ) ){ 
+				select -r $leafMesh;
+				hyperShade -assign $sg;
+			} else if( $createTexturedShaders ){
+				// create shader to match leaf rendering by brush
+				float $color1[] = `getAttr ($brush + ".leafColor1")`;
+				float $color2[] = `getAttr ($brush + ".leafColor2")`;
+				float $specular = `getAttr ($brush + ".leafSpecular")`;
+				float $translucence = `getAttr ($brush + ".leafTranslucence")`;
+				int $tType = $texType;
+				int $colTex = $colorTex;
+				int $opTex = $opacityTex;
+				string $tName = $texName;
+				float $repU = $repeatU;
+				float $repV = $repeatV;
+				float $offU = $offsetU;
+				float $offV = $offsetV;
+				if( !$useBranch ){
+					$tName = `getAttr ($brush + ".leafImage")`;
+					if( size( $tName ) > 0 ){
+						$colTex = true;
+						$opTex = true;
+						$tType = 4;
+						$repU = 1.0;
+						$repV = 1.0;
+						$offU = 0.0;
+						$offV = 0.0;
+					} else {
+						$colTex = false;
+						$opTex = false;
+					}
+				}
+				float $smearU = 0.0;
+				float $smearV = 0.0;
+				float $smear = 1.0;
+				float $texColor1[3];
+				float $reflectivity = 0.0;
+				if( $brushType == 5 ){ // mesh brush
+					$reflectivity = `getAttr ($brush + ".leafReflectivity")`;
+				}
+				$texColor1[0] = $texColor1[1] = $texColor1[2] = 1.0;
+				$texColor2[0] = $texColor2[1] = $texColor2[2] = 0.0;
+				createAndAssignShader(($brush + "LeafShader"), $color1, $color2,
+						$incand1, $specularColor, $specular, $specularPower, $glowIntensity,
+						$translucence, $transp, $softness,
+						$tType, $colTex, $opTex, $tName, 
+						$texColor1, $texColor2, $smear, $smearU, $smearV,
+						$fractalRatio, $fractalAmplitude, $fractalThreshold,
+						$repU, $repV, $offU, $offV, 
+						$reflectivity, $textureSpecular, $isFlat, $brush, $leafMesh );
+			} else {
+				// color per vertex.. create simple surface shader 
+				string $material = `shadingNode -asShader "lambert"`;
+				// create and assign shading group
+				$sg = `sets -renderable true -noSurfaceShader true -empty -name ($material + "SG")`;
+				defaultNavigation
+					-connectToExisting
+					-source $material
+					-destination $sg;
+				select -r $leafMesh;
+				hyperShade -assign $sg;
+			}
+
+			if( !$constructionHistory ){
+				delete -ch $leafMesh;
+			}
+		}
+
+
+
+
+		// setup flowerMesh
+		int $flowers = ($tubes && getAttr( $brush + ".flowers" ));
+		if( $flowers ){
+			if( getAttr( $brush + ".petalForwardTwist" )) {
+				$linkCamera = true;
+			}
+			int $useBranch = `getAttr($brush + ".flowerUseBranchTex")`;
+			float $flatness = `getAttr($brush + ".petalFlatness" )`;
+			$isFlat = $flatness > 0.999
+					|| ($brushType < 4 && $flatness > 0.7);
+			if( !$linkCamera && ($brushType < 4 ) && !$useBranch ){
+				// to better simulate the 2D map method we use forwardTwist
+				// when converting stamp style brushes. TstrokeShape has the
+				// same checks as the code below and sets forward twist on
+				// during the pfxToPoly call.
+				if( $flatness < 0.8 ){
+					string $tName = `getAttr ($brush + ".flowerImage")`;
+					if( size( $tName ) > 0 ){
+						$linkCamera = true;
+						$isFlat = true;
+					}
+				} 
+			} 
+
+			string $flowerMesh;
+			if( 0 == $outputType ){
+				string $flowerParent = `createNode transform -name ($brush+"Flower") -p $meshParent`;
+				$flowerMesh = createMeshNodeUnder($brush+"FlowerShape", $flowerParent);
+			
+				// make sure we get the full path, since a name that's unique now
+				// might not be unique by the time we're done
+				$selectedMeshes = `selectedNodes`;
+				$newMeshes[$meshCount] = $selectedMeshes[0];
+		
+				connectAttr ($stroke + ".worldFlowerMesh[0]") ($flowerMesh + ".inMesh");
+			} else {
+				$flowerMesh = $nurbsGroups[2];
+				$newMeshes[$meshCount] = $flowerMesh;
+			}
+			$meshCount++;
+
+			$shaderName = ($brush + "FlowerShader");
+			$sg = ($shaderName + "SG");
+			if( objExists( $shaderName ) && objExists( $sg ) ){ 
+				select -r $flowerMesh;
+				hyperShade -assign $sg;
+			 } else if( $createTexturedShaders ){
+				// create shader to match flower rendering by brush
+				float $color1[] = `getAttr ($brush + ".petalColor1")`;
+				float $color2[] = `getAttr ($brush + ".petalColor2")`;
+				float $specular = `getAttr ($brush + ".flowerSpecular")`;
+				float $translucence = `getAttr ($brush + ".flowerTranslucence")`;
+				int $tType = $texType;
+				int $colTex = $colorTex;
+				int $opTex = $opacityTex;
+				string $tName = $texName;
+				float $repU = $repeatU;
+				float $repV = $repeatV;
+				float $offU = $offsetU;
+				float $offV = $offsetV;
+				if( !$useBranch ){
+					$tName = `getAttr ($brush + ".flowerImage")`;
+					if( size( $tName ) > 0 ){
+						$colTex = true;
+						$opTex = true;
+						$tType = 4;
+						$repU = 1.0;
+						$repV = 1.0;
+						$offU = 0.0;
+						$offV = 0.0;
+					} else {
+						$colTex = false;
+						$opTex = false;
+					}
+				}
+				float $smearU = 0.0;
+				float $smearV = 0.0;
+				float $smear = 1.0;
+				float $texColor1[3];
+				float $reflectivity = 0.0;
+				if( $brushType == 5 ){ // mesh brush
+					$reflectivity = `getAttr ($brush + ".flowerReflectivity")`;
+				}
+				$texColor1[0] = $texColor1[1] = $texColor1[2] = 1.0;
+				$texColor2[0] = $texColor2[1] = $texColor2[2] = 0.0;
+				createAndAssignShader(($brush + "FlowerShader"), $color1, $color2,
+						$incand1, $specularColor, $specular, $specularPower, $glowIntensity,
+						$translucence, $transp, $softness,
+						$tType, $colTex, $opTex, $tName, 
+						$texColor1, $texColor2, $smear, $smearU, $smearV,
+						$fractalRatio, $fractalAmplitude, $fractalThreshold,
+						$repU, $repV, $offU, $offV, 
+						$reflectivity, $textureSpecular, $isFlat, $brush, $flowerMesh );
+
+			} else {
+				// color per vertex.. create simple surface shader 
+				string $material = `shadingNode -asShader "lambert"`;
+				// create and assign shading group
+				$sg = `sets -renderable true -noSurfaceShader true -empty -name ($material + "SG")`;
+				defaultNavigation
+					-connectToExisting
+					-source $material
+					-destination $sg;
+				select -r $flowerMesh;
+				hyperShade -assign $sg;
+			}
+
+			if( !$constructionHistory ){
+				delete -ch $flowerMesh;
+			}
+		}
+		if($hideStrokes){
+			setAttr  ($stroke + ".visibility") 0;
+		}
+		if($linkCamera && ($cameraTranslate != "")){
+			//Adding warning for Bug# 200449
+			global string $warningMsgWhileLinkingCamera;
+			string $fmt = " Stroke \"^1s\" will rebuild when the camera view changes. This can make tumbling the view slow." +
+							" For more information, see the section \"Convert Paint Effects to polygons\" in Maya Docs.";
+			$warningMsgWhileLinkingCamera = `format -s $stroke $fmt`;
+		
+			if( !`isConnected $cameraTranslate ($stroke + ".cameraPoint")` ){ 
+				connectAttr -f $cameraTranslate ($stroke + ".cameraPoint");
+			}
+		}
+		
+	}	
+	select -r $newMeshes;
+	$status = 1;
+
+	return $status;
+}
+
+
