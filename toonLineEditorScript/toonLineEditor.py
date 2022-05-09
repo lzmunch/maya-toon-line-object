@@ -5,6 +5,7 @@ import maya.mel as mm
 import sortTool
 import os
 
+# replaces C:\Program Files\Autodesk\Maya<version>\scripts\paintEffects\doPaintEffectsToGeom.mel
 # original mel script is broken, use this instead
 # use directory of current scene file to find scripts path
 sceneDir = os.path.dirname(cmds.file(query=True, sceneName=True)) 
